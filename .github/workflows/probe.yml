@@ -1,0 +1,101 @@
+name: Uptime Probe
+
+# 站点可用性外部探测。跑在 GitHub 托管的 runner 上，与被监控目标相互独立，
+# 因此目标主机整体宕机时仍能告警 —— 这是主机内自监控无法覆盖的场景。
+#
+# 注意：本仓库为 public，Actions 运行日志任何人可见。
+# 探测目标与推送 topic 均通过 secret 注入，并在日志中逐项 mask。
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # 手动触发，用于验证通道
+
+concurrency:
+  group: uptime-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # 取回上一轮 UP/DOWN 状态，用于「仅在状态翻转时告警」，避免每 5 分钟刷屏
+      - name: 恢复上次状态
+        uses: actions/cache/restore@v4
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: |
+            uptime-state-
+
+      - name: 探测并按需告警
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PROBE_DOMAINS: ${{ secrets.PROBE_DOMAINS }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${PROBE_DOMAINS:-}" ]; then
+            echo "::error::PROBE_DOMAINS secret 未配置"; exit 1
+          fi
+
+          # 逐项 mask：secret 的自动遮蔽只对完整值生效，单个域名需自己登记
+          for d in $PROBE_DOMAINS; do echo "::add-mask::$d"; done
+
+          FAILED=""; IDX=0
+
+          # runner 在境外，跨境到目标偶有抖动 —— 连续 3 次失败才判定 DOWN
+          for d in $PROBE_DOMAINS; do
+            IDX=$((IDX + 1)); ok=0; last=""
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$d/" 2>/dev/null || echo 000)
+              last="$code"
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              [ "$attempt" -lt 3 ] && sleep 10
+            done
+            if [ "$ok" -eq 0 ]; then
+              FAILED="${FAILED}${FAILED:+, }${d} (HTTP ${last})"
+              echo "::warning::目标 #${IDX} 探测失败，最后状态码 ${last}"
+            else
+              echo "目标 #${IDX} OK"
+            fi
+          done
+
+          PREV=$(cat state.txt 2>/dev/null || echo UP)
+          if [ -n "$FAILED" ]; then CUR=DOWN; else CUR=UP; fi
+          echo "$CUR" > state.txt
+          echo "状态: 上次=${PREV} 本次=${CUR}"
+
+          notify() {   # ntfy JSON publish API：header 形式会因中文标题触发 ByteString 错误
+            if [ -z "${NTFY_TOPIC:-}" ]; then echo "NTFY_TOPIC 未配置，跳过推送"; return 0; fi
+            curl -s -o /dev/null --max-time 20 -X POST https://ntfy.sh/ \
+              -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$1" --arg m "$2" \
+                       --argjson p "$3" --arg g "$4" \
+                       '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$g]}')"
+          }
+
+          # 仅在状态翻转时推送
+          # 多行消息用 printf 构造 —— 字符串字面跨行会顶格，从而终止 YAML 块标量
+          if [ "$CUR" = "DOWN" ] && [ "$PREV" != "DOWN" ]; then
+            MSG=$(printf '外部探测连续 3 次失败：%s\n\n目标可能整机宕机或反向代理未运行；此时主机内自监控可能同样已失效，建议直接 SSH 检查。' "$FAILED")
+            notify "站点不可达 · 外部探测" "$MSG" 5 rotating_light
+          elif [ "$CUR" = "UP" ] && [ "$PREV" = "DOWN" ]; then
+            notify "站点已恢复 · 外部探测" "全部目标恢复 HTTP 200。" 3 white_check_mark
+          fi
+
+          # 每周心跳（UTC 周一 01:00 ≈ 北京时间周一 09:00），确认探测本身仍在运行。
+          # GitHub 会在仓库 60 天无提交后自动禁用 scheduled workflow。
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H%M)" -lt 0105 ]; then
+            notify "探测心跳 · 一切正常" "外部探测运行正常，全部目标可达。此消息每周一早上发送一次；若某周未收到，说明探测已停止，需到仓库 Actions 页面重新启用。" 2 heartbeat
+          fi
+
+          if [ -n "$FAILED" ]; then exit 1; fi
+
+      - name: 保存状态
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
