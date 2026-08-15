@@ -69,13 +69,29 @@ jobs:
           echo "$CUR" > state.txt
           echo "状态: 上次=${PREV} 本次=${CUR}"
 
-          notify() {   # ntfy JSON publish API：header 形式会因中文标题触发 ByteString 错误
+          # ntfy JSON publish API：header 形式会因中文标题触发 ByteString 错误。
+          # 推送结果必须落日志 —— 丢弃 curl 输出会让「告警没发出去」这件事本身也无声。
+          # 且本函数始终 return 0：GitHub Actions 用 bash -e 执行，
+          # 函数返回非零会中断整个脚本，连状态文件都来不及写。
+          notify() {
             if [ -z "${NTFY_TOPIC:-}" ]; then echo "NTFY_TOPIC 未配置，跳过推送"; return 0; fi
-            curl -s -o /dev/null --max-time 20 -X POST https://ntfy.sh/ \
-              -H 'Content-Type: application/json' \
-              -d "$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$1" --arg m "$2" \
-                       --argjson p "$3" --arg g "$4" \
-                       '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$g]}')"
+            local payload http attempt
+            payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$1" --arg m "$2" \
+                            --argjson p "$3" --arg g "$4" \
+                            '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$g]}')
+            for attempt in 1 2; do
+              http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST https://ntfy.sh/ \
+                     -H 'Content-Type: application/json' -d "$payload" 2>/dev/null) || http=""
+              http=${http:-000}
+              if [ "$http" = "200" ]; then
+                echo "推送成功 HTTP=200 priority=$3"
+                return 0
+              fi
+              echo "::warning::推送失败 HTTP=${http}（第 ${attempt} 次）"
+              [ "$attempt" -eq 1 ] && sleep 5
+            done
+            echo "::error::推送最终失败，该告警未送达"
+            return 0
           }
 
           # 仅在状态翻转时推送
