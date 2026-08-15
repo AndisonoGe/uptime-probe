@@ -49,7 +49,9 @@ jobs:
           for d in $PROBE_DOMAINS; do
             IDX=$((IDX + 1)); ok=0; last=""
             for attempt in 1 2 3; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$d/" 2>/dev/null || echo 000)
+              # curl 失败时 -w 自身已输出 000，不能再 `|| echo 000`，否则拼成 000000
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$d/" 2>/dev/null)
+              code=${code:-000}
               last="$code"
               if [ "$code" = "200" ]; then ok=1; break; fi
               [ "$attempt" -lt 3 ] && sleep 10
