@@ -49,12 +49,18 @@ jobs:
           for d in $PROBE_DOMAINS; do
             IDX=$((IDX + 1)); ok=0; last=""
             for attempt in 1 2 3; do
-              # curl 失败时 -w 自身已输出 000，不能再 `|| echo 000`，否则拼成 000000
-              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$d/" 2>/dev/null)
+              # 两处都不能省：
+              #   1) curl 失败时 -w 自身已输出 000，不可再 `|| echo 000`（会拼成 000000）
+              #   2) 但 `|| true` 必须保留 —— GitHub Actions 以 bash -e 执行，
+              #      curl 非零退出会让赋值语句中断整个脚本，导致站点真挂时
+              #      在第一个失败域名处崩溃、一条告警都发不出去。
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$d/" 2>/dev/null) || true
               code=${code:-000}
               last="$code"
               if [ "$code" = "200" ]; then ok=1; break; fi
-              [ "$attempt" -lt 3 ] && sleep 10
+              # 必须用 if 而非 `[ ... ] && sleep`：后者在条件不成立时整行返回非零，
+              # bash -e 下会直接终止脚本（第 3 次重试后必崩）。
+              if [ "$attempt" -lt 3 ]; then sleep 10; fi
             done
             if [ "$ok" -eq 0 ]; then
               FAILED="${FAILED}${FAILED:+, }${d} (HTTP ${last})"
@@ -78,7 +84,8 @@ jobs:
             local payload http attempt
             payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$1" --arg m "$2" \
                             --argjson p "$3" --arg g "$4" \
-                            '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$g]}')
+                            '{topic:$t,title:$ti,message:$m,priority:$p,tags:[$g]}') || payload=""
+            if [ -z "$payload" ]; then echo "::error::payload 构造失败，告警未送达"; return 0; fi
             for attempt in 1 2; do
               http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST https://ntfy.sh/ \
                      -H 'Content-Type: application/json' -d "$payload" 2>/dev/null) || http=""
@@ -88,7 +95,7 @@ jobs:
                 return 0
               fi
               echo "::warning::推送失败 HTTP=${http}（第 ${attempt} 次）"
-              [ "$attempt" -eq 1 ] && sleep 5
+              if [ "$attempt" -eq 1 ]; then sleep 5; fi   # 同上：不可写成 `[ ] && sleep`
             done
             echo "::error::推送最终失败，该告警未送达"
             return 0
